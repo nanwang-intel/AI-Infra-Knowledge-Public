@@ -1,0 +1,18 @@
+---
+layout: default
+---
+<article>
+  <header class="article-header">
+    <p class="article-category">{{ page.category | default: "Architecture" }}</p>
+    {% if page.description %}<p class="article-description">{{ page.description }}</p>{% endif %}
+    <p class="article-meta">
+      {% if page.date %}{{ page.date | date: "%Y-%m-%d" }}{% endif %}
+      {% if page.updated %} · 更新于 {{ page.updated | date: "%Y-%m-%d" }}{% endif %}
+    </p>
+  </header>
+  {{ content }}
+  <footer class="article-footer">
+    <p>本文以 GitHub Markdown 为唯一源稿。勘误与更新以仓库版本为准。</p>
+    {% if page.wechat_url %}<p><a href="{{ page.wechat_url }}">微信公众号版本</a></p>{% endif %}
+  </footer>
+</article>

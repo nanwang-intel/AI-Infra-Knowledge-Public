@@ -1,0 +1,7 @@
+_site/
+.jekyll-cache/
+.sass-cache/
+.DS_Store
+Thumbs.db
+*.tmp
+.public-export-manifest.json
