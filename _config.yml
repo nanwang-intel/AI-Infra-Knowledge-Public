@@ -1,7 +1,7 @@
 ﻿title: AI Infra Knowledge
 description: Architecture-first notes on AI systems, memory, interconnects, and inference infrastructure.
 lang: zh-CN
-url: https://<公开账号>.github.io
+url: https://nanwang-intel.github.io
 baseurl: /AI-Infra-Knowledge-Public
 markdown: kramdown
 kramdown:

@@ -1,0 +1,864 @@
+---
+title: "100 TB/s 不是更快的 DRAM：d-Matrix Raptor 如何删除 HBM 的片外内存边界"
+description: "从垂直 I/O、bank-to-engine 映射和系统瓶颈，审计 Raptor 3D DRAM 的 100 TB/s 与 0.37 pJ/bit。"
+date: 2026-09-05
+updated: 2026-09-05
+slug: dmatrix-raptor-3d-dram
+status: published
+github: true
+public: true
+wechat: draft
+wechat_url:
+cover: /assets/dmatrix-raptor-3d-dram/2026-08-24_2-56-50-728x355.jpg
+---
+
+# 100 TB/s 不是更快的 DRAM：d-Matrix Raptor 如何删除 HBM 的片外内存边界
+
+d-Matrix 披露的 Raptor 3D DRAM，把 32 GB 定制 DRAM 与 N4 计算逻辑做 face-to-face 堆叠，宣称提供 100 TB/s 带宽和 0.37 pJ/bit 的垂直 I/O 能效。它最值得关注的地方，不是又出现了一种“比 HBM 更快的内存”，而是计算和内存之间那条昂贵的片外通路被重新画了一遍：不再用有限数量的高速 PHY 把数据送入统一计算核心，而是用大量短距离垂直连接，把 DRAM bank 直接铺到本地 tensor engine 下方。
+
+> **核心判断：Raptor 的本质不是提高 DRAM cell 的速度，而是删除 package-scale PHY 与全局数据搬运，用超宽垂直 I/O、bank-level parallelism 和近存计算换取带宽。100 TB/s 是局部数据流的胜利；它能否变成模型级 token/s，仍取决于容量拼接、激活网络、KV 流量与流水线延迟。**
+
+本文基于 Wccftech 对 d-Matrix 演示材料的转述进行架构分析。公开数字主要来自厂商披露，不等同于第三方 benchmark。原始报道见：[d-Matrix's Raptor 3D DRAM Achieves SRAM-Class Bandwidth at 1/10th the HBM Power](https://wccftech.com/d-matrix-raptor-3d-dram-achieves-sram-class-bandwidth-at-1-10th-the-hbm-power/amp/)。
+
+## 关键结论
+
+- Raptor 是 **logic-on-DRAM 的计算存储融合器件**，不是传统意义上的 HBM 后继品。
+- “删除 PHY”不是没有 I/O，而是删除面向封装级距离的高速 SerDes PHY、均衡、训练与 beachfront routing，改用超宽、低速、短距离的垂直接口。
+- 100 TB/s 来自数百个 DRAM bank 与 256 个 tensor engine 的局部并行，不来自提高单 pin 速率。
+- 0.37 pJ/bit 乘以 100 TB/s，对应约 296 W I/O 功耗。这个数字与报道中的约 300 W 自洽，但不包含完整 tensor compute、片间 fabric 和供电散热。
+- 对比 2.4 pJ/bit 的 HBM I/O，Raptor 是约 6.5 倍，不是严格的 10 倍；13.5 倍需要把 HBM 后续片上搬运按约 5 pJ/bit 一并计入。
+- 32 GB 容量处在 SRAM 与 HBM 之间。它能够容纳约 64B INT4 参数，却无法单独容纳 3T 模型。
+- 该结构最适合低 batch、memory-bound 的 MoE decode，以及能够把计算固定在权重所在地的流水化系统。
+- “1M context、3T-class model、约 1,000 TPS/user”不能由 100 TB/s 单点规格直接推出，必须披露模型稀疏度、KV 结构、卡数和 TPS 口径。
+
+## 目录
+
+1. Raptor 到底是什么
+2. HBM 的带宽墙在哪里
+3. 删除 PHY 到底删除了什么
+4. 100 TB/s 如何产生
+5. 840 个 Bank 如何喂给 256 个 Tensor Engine
+6. 0.37 pJ/bit 与“十分之一功耗”的口径
+7. 为什么 Logic 必须放在 DRAM 上方
+8. 4 ms Refresh、ECC 与良率设计
+9. SRAM、HBM 与 3D DRAM 的真实交换
+10. 为什么它适合 LLM Decode
+11. 3T 模型与 1M Context 性能审计
+12. 从单器件扩展到系统后，瓶颈移到哪里
+13. 与计算型 KV 状态平面的结合
+14. 还需要哪些验证数据
+
+---
+
+## 1. Raptor 到底是什么
+
+报道披露的 Raptor 由一层 N4 logic die 和一层定制 DRAM 通过 36 µm pitch 的 face-to-face 连接组成。公开规格如下。
+
+| 参数 | 披露值 | 架构含义 |
+|---|---:|---|
+| 容量 | 32 GB | 高于纯 SRAM，低于多堆 HBM |
+| 峰值带宽 | 100–100+ TB/s | 依赖大规模 bank 并行与垂直 I/O |
+| 垂直 I/O 能效 | 0.37 pJ/bit，称为 measured | 不是整卡能效 |
+| Logic 工艺 | TSMC N4 | 顶层 tensor compute 与控制逻辑 |
+| 3D 连接 | Face-to-face，36 µm pitch | 缩短 memory-to-compute 距离 |
+| Tensor engine | 256/chiplet | 与 DRAM bank 做局部映射 |
+| DRAM bank | 840 | 无法直接按每 engine 四 bank 对称分配 |
+| DRAM 输出 | 32 B/bank/column | 三个 bank 一次提供 96 B |
+| 内部 flit | 128 B | 需要聚合和重排 |
+| Logic 功率密度 | 约 0.5 W/mm² | 不代表总功耗只有数百瓦以内 |
+| 工作结温 | 最高约 105°C | 推动 refresh 间隔缩短到 4 ms |
+| Refresh 带宽损失 | 1.37% | 平均吞吐口径，未必代表尾延迟 |
+| ECC | Reed–Solomon $T=2$ + CRC | 每 128 B 纠正两个 symbol error |
+| Spare bank | 约 8–9% | 用 MUX chain 替换缺陷 bank |
+| Microbank | 1,366 rows，5.33 MB | 支持细粒度刷新、修复与并行访问 |
+
+从产品分类看，Raptor 更接近一个带有大容量本地 DRAM 的 near-memory accelerator：
+
+```text
+传统 GPU/HBM
+
+HBM stack -> HBM PHY -> package/interposer -> GPU PHY
+          -> memory controller -> global NoC -> cache -> tensor core
+
+Raptor
+
+local DRAM bank -> short vertical I/O -> local data path -> tensor engine
+```
+
+前者把 HBM 作为独立存储器；后者把 DRAM bank 变成计算阵列的物理组成部分。
+
+### 1.1 文章主张什么
+
+文章主张 Raptor 在 SRAM、HBM 之间找到一个新工作点：
+
+- 带宽接近 SRAM accelerator 的数量级；
+- 容量明显大于片上 SRAM；
+- I/O 能耗明显低于 HBM；
+- 通过 3D 集成摆脱 HBM PHY beachfront 限制。
+
+### 1.2 文章没有证明什么
+
+当前公开信息没有证明：
+
+- 整个 accelerator 的能耗只有 HBM 系统的十分之一；
+- 任意 workload 都能持续获得 83–85 TB/s；
+- 32 GB 单元能够低延迟扩展到数十或数百个；
+- 1M context 下约 1,000 TPS/user 是单请求串行 decode 速度；
+- 3D bonding 的成本与量产良率已经优于 HBM。
+
+---
+
+## 2. HBM 的带宽墙在哪里
+
+HBM 的问题不是 DRAM cell array 缺少内部并行度。真正的瓶颈是这些并行度必须通过有限的 die edge、PHY、interposer routing 和 memory controller 暴露给计算 die。
+
+### 2.1 Beachfront 限制
+
+HBM PHY 需要占据 accelerator die 边缘。每增加一个 HBM stack，都要同时增加：
+
+- PHY macro；
+- die edge 长度；
+- interposer 信号走线；
+- memory controller；
+- 电源、时钟与信号完整性预算。
+
+这和海边地产类似：HBM stack 可以继续增加，但 accelerator die 的“海岸线”不会跟着无限增长。技术结论是，带宽扩展逐渐被 PHY 面积和封装 perimeter 限制，而不是只被 DRAM 容量限制。
+
+### 2.2 高速接口的能耗
+
+HBM 相对 DDR 已经采用宽接口和较低 pin speed，但相对 face-to-face 3D 连接，它仍要驱动更长、更重的电气路径。
+
+每 bit 动态能量可粗略写成：
+
+$$
+E_{bit}
+\approx
+C_{path}V^2
++E_{clock}
++E_{PHY}
+$$
+
+其中 $C_{path}$ 包括 bump、interposer、package trace 和 receiver input。路径越长、负载越大，驱动与时钟能耗越高。
+
+### 2.3 数据通过 HBM PHY 后还没到计算单元
+
+HBM 报告的接口能效通常不包含数据进入 accelerator 后的全部搬运。一个 weight tile 可能继续经过：
+
+```text
+HBM PHY
+  -> memory controller
+  -> global NoC
+  -> L2/cache
+  -> local SRAM
+  -> tensor engine operand buffer
+```
+
+因此，同样是“pJ/bit”，至少有两个边界：
+
+1. **Memory I/O energy**：只计算 HBM link；
+2. **Compute-visible data delivery energy**：计算从 DRAM 到 tensor engine 的完整路径。
+
+Raptor 的优势主要来自第二个边界：不仅垂直 I/O 更短，而且 tensor engine 被放到 bank 附近，减少后续全局搬运。
+
+---
+
+## 3. 删除 PHY 到底删除了什么
+
+“No PHY”是一句传播效果很好的标题，但工程上并不精确。Raptor 仍然需要 I/O driver、receiver、clocking、timing control 和错误检测。
+
+它删除的是面向 package-scale 距离的高速 PHY，包括其中相当一部分：
+
+- serializer/deserializer；
+- 高摆幅 transmitter；
+- 高速 receiver；
+- training 与 deskew；
+- clock recovery 或复杂时钟分配；
+- equalization；
+- DBI 与高速链路编码；
+- 受 die edge 限制的 PHY macro。
+
+替代方案是大量短距离、低速率的垂直 wire：
+
+$$
+B_{total}
+=
+N_{wire}\times r_{wire}
+$$
+
+HBM 依赖有限数量的 wire 运行在较高 $r_{wire}$；Raptor 通过 3D 集成大幅提高 $N_{wire}$，允许每根 wire 以更低速率工作。
+
+这会同时改善三个指标：
+
+- 单 bit I/O 能耗下降；
+- 单位 footprint 的 I/O 密度上升；
+- memory channel 可以更细粒度地绑定本地计算单元。
+
+需要强调：36 µm pitch 仍不是“无限互连密度”。它决定可放置的垂直连接数量、供电连接数量以及信号/电源比例。Raptor 的 100 TB/s 必须在这套 bump budget 中同时容纳数据、地址、控制、时钟、电源、地与冗余连接。
+
+---
+
+## 4. 100 TB/s 如何产生
+
+100 TB/s 等于：
+
+$$
+100\times10^{12}\ \mathrm{B/s}
+\times8
+=
+8\times10^{14}\ \mathrm{bit/s}
+$$
+
+如果内部一次消费 128 B flit，每秒需要处理：
+
+$$
+\frac{100\times10^{12}}{128}
+\approx
+7.81\times10^{11}\ \mathrm{flit/s}
+$$
+
+若 256 个 tensor engine 均匀分担，每个 engine 平均对应：
+
+$$
+\frac{100\ \mathrm{TB/s}}{256}
+\approx
+390.6\ \mathrm{GB/s}
+$$
+
+显然，这不可能由一条中央总线提供。合理组织只能是高度分布式的数据路径：
+
+```text
+Bank group 0  -> local channel 0  -> Tensor Engine 0
+Bank group 1  -> local channel 1  -> Tensor Engine 1
+...
+Bank group N  -> local channel N  -> Tensor Engine N
+```
+
+因此，100 TB/s 是以下三个条件的乘积：
+
+$$
+B_{effective}
+=
+B_{bank-parallel}
+\times U_{mapping}
+\times U_{schedule}
+$$
+
+其中：
+
+- $B_{bank-parallel}$：全部 bank 同时服务时的物理带宽；
+- $U_{mapping}$：模型布局与 bank/channel 映射效率；
+- $U_{schedule}$：运行时请求能否持续填满这些 channel。
+
+报道使用 83–85% effective bandwidth utilization。若峰值为 100 TB/s，则持续带宽约为：
+
+$$
+B_{sustained}
+\approx83\text{–}85\ \mathrm{TB/s}
+$$
+
+这个利用率对规则权重流可能成立，但不能自动外推到 KV 随机访问、embedding lookup 或 expert hotspot。
+
+---
+
+## 5. 840 个 Bank 如何喂给 256 个 Tensor Engine
+
+Raptor 的 bank 数量和 tensor engine 数量并不天然对齐：
+
+$$
+840\neq256\times4=1024
+$$
+
+文章披露每个 DRAM bank 每个 column access 提供 32 B。三个 bank 组成一个 channel 时，一次只有：
+
+$$
+3\times32\ \mathrm{B}=96\ \mathrm{B}
+$$
+
+而 tensor engine 或其内部接口需要 128 B flit：
+
+$$
+96\ \mathrm{B}\neq128\ \mathrm{B}
+$$
+
+如果简单 overfetch 到 128 B，利用率只有：
+
+$$
+U=\frac{96}{128}=75\%
+$$
+
+更合理的办法是跨多个 DRAM transaction 聚合和重排。四次 96 B 正好等于三个 128 B flit：
+
+$$
+4\times96\ \mathrm{B}
+=384\ \mathrm{B}
+=3\times128\ \mathrm{B}
+$$
+
+这可以避免固定 25% 浪费，但需要：
+
+- aggregation buffer；
+- flit boundary 重排；
+- channel steering；
+- sequence tracking；
+- ECC codeword 对齐；
+- bank 不同时 ready 时的 backpressure。
+
+这也是为什么“pitch-matched”不等于一对一硬绑定。物理上靠近只解决 wire distance，逻辑上仍需处理 bank 数、访问粒度和 engine 消费粒度不匹配。
+
+---
+
+## 6. 0.37 pJ/bit 与“十分之一功耗”的口径
+
+功耗由带宽和每 bit 能量相乘得到：
+
+$$
+P=B_{bit}\times E_{bit}
+$$
+
+Raptor 在 100 TB/s 下的 I/O 功耗为：
+
+$$
+P_{Raptor,I/O}
+=
+8\times10^{14}
+\times0.37\times10^{-12}
+\approx296\ \mathrm{W}
+$$
+
+这与文章中的约 300 W 一致。
+
+若用 2.4 pJ/bit 的 HBM I/O 提供相同 100 TB/s：
+
+$$
+P_{HBM,I/O}
+=
+8\times10^{14}
+\times2.4\times10^{-12}
+=1,920\ \mathrm{W}
+$$
+
+因此纯接口能效差距是：
+
+$$
+\frac{2.4}{0.37}
+\approx6.5\times
+$$
+
+如果把 HBM 到 tensor engine 的后续搬运也计入，并采用文章给出的约 5 pJ/bit：
+
+$$
+P_{HBM,path}
+=
+8\times10^{14}
+\times5\times10^{-12}
+=4,000\ \mathrm{W}
+$$
+
+此时差距为：
+
+$$
+\frac{5}{0.37}
+\approx13.5\times
+$$
+
+所以标题中的“十分之一 HBM 功耗”是一个区间化表达：
+
+| 边界 | 相对能效 |
+|---|---:|
+| Raptor vertical I/O 对 HBM I/O | 约 6.5× |
+| Raptor vertical I/O 对 HBM 完整数据路径 | 约 13.5× |
+| 标题传播口径 | 约 10× |
+
+0.37 pJ/bit 并不包含完整系统功耗。至少还要加入：
+
+$$
+P_{total}
+=
+P_{DRAM-array}
++P_{refresh}
++P_{vertical-I/O}
++P_{tensor}
++P_{local-NoC}
++P_{chiplet-fabric}
++P_{VR-loss}
+$$
+
+如果不统一功耗边界，“13.5×”只能说明数据搬运方向正确，不能直接说明每 token 能效提高 13.5 倍。
+
+---
+
+## 7. 为什么 Logic 必须放在 DRAM 上方
+
+3D 堆叠有两种基本方向。
+
+```text
+方案 A：DRAM-on-logic       方案 B：logic-on-DRAM
+
+Cold plate                 Cold plate
+DRAM                       Logic
+DRAM                       DRAM
+Logic                      Package
+Package
+```
+
+在 DRAM-on-logic 中，计算逻辑产生的热量需要穿过温度敏感的 DRAM 才能到达 cold plate。随着温度上升，DRAM cell 漏电增加、retention time 缩短、refresh 频率上升。
+
+Raptor 选择 logic-on-top：
+
+```text
+Cold plate
+    ↓
+N4 logic die
+    ↓ face-to-face links
+custom DRAM die
+    ↓
+package/substrate
+```
+
+这样做的优势是：
+
+- 高功耗 logic 最接近 cold plate；
+- 热量不必先穿过 DRAM；
+- 顶层逻辑可以承受更高局部热通量；
+- DRAM 更容易维持在设计温度以内。
+
+但问题没有消失，只是改变了形态：
+
+- 顶层 logic 的电源如何低阻抗送达；
+- 垂直信号连接和 power/ground 连接如何分配；
+- DRAM 仍会受到 logic 的热耦合；
+- face-to-face 后的测试、返修和 known-good-die 管理更困难；
+- die warpage 与热机械应力需要长期可靠性验证。
+
+文章给出的约 0.5 W/mm² 是 logic power density，不是整个 stack 的总功耗。若逻辑面积达到数百平方毫米，计算部分本身仍可能是数百瓦级。
+
+---
+
+## 8. 4 ms Refresh、ECC 与良率设计
+
+### 8.1 为什么 Refresh 加快八倍
+
+Raptor 面向约 105°C junction。DRAM 温度升高后 retention time 下降，因此 refresh interval 从常见的约 32 ms 缩短到 4 ms：
+
+$$
+\frac{32\ \mathrm{ms}}{4\ \mathrm{ms}}
+=8
+$$
+
+文章宣称 refresh 只损失 1.37% 带宽。要做到这一点，必须依靠：
+
+- 小粒度 microbank；
+- bank-level refresh；
+- staggered refresh scheduling；
+- 其他 bank 隐藏当前 bank 的刷新时间；
+- 足够深的请求队列。
+
+但平均带宽损失 1.37%，不表示 p99 service time 也只增加 1.37%。如果 tensor engine 与少量 bank 强绑定，refresh 会表现为周期性局部 bubble。
+
+### 8.2 为什么需要小 Microbank
+
+报道给出的 microbank 规格是 1,366 rows、5.33 MB。小 bank 可以：
+
+- 增加并行 bank 数量；
+- 缩小一次 refresh 的阻塞范围；
+- 缩小缺陷隔离单元；
+- 允许 spare bank 替换；
+- 减少部分 row activation 的无效数据。
+
+代价是外围电路占比增加，包括 decoder、sense amplifier、row buffer、repair MUX 和控制状态。
+
+公开数字中仍有一个组织层级缺口：
+
+$$
+840\times5.33\ \mathrm{MB}
+\approx4.48\ \mathrm{GB}
+$$
+
+它与 32 GB 总容量不一致。这意味着 840 banks、5.33 MB microbank 和 32 GB 很可能分别位于 chiplet、slice、layer 或 card 的不同层级。没有完整 organization diagram，不能把它们直接相乘重建器件。
+
+### 8.3 Reed–Solomon $T=2$ 与 CRC
+
+Raptor 在 logic die 上使用 Reed–Solomon $T=2$，声称每 128 B 可纠正两个 symbol error，并使用 CRC 检测更广泛的错误。
+
+其目标不只是普通随机 bit flip，还可能包括：
+
+- 垂直连接局部失效；
+- column 或 bank 相关 burst error；
+- bonding defect；
+- 高温下的 retention error；
+- repair 后的数据路径异常。
+
+这里的 symbol 不一定是一 bit。若使用 $GF(2^m)$，每个 symbol 包含 $m$ bits。公开资料还需要补充 symbol 宽度、parity overhead、decoder latency、scrub 策略以及 detected-but-uncorrectable error 的传播方式。
+
+### 8.4 Spare Bank 与堆叠良率
+
+3D stack 的简单良率近似为：
+
+$$
+Y_{stack}
+\approx
+Y_{logic}\times Y_{DRAM}\times Y_{bond}
+$$
+
+只要任一 die 或 bonding interface 存在致命缺陷，整个 stack 都可能报废。Raptor 预留约 8–9% spare banks，通过 MUX chain 重映射缺陷区域，目的是把部分 die-level defect 降级为可修复 bank defect。
+
+其代价包括：
+
+- 额外 DRAM 面积；
+- repair map；
+- MUX 延迟和功耗；
+- 修复路径造成的时序偏差；
+- spare 用尽后的降级或报废策略。
+
+因此，“高良率、低成本”不能只由小于四层堆叠推出，最终仍需要 wafer yield、bonding yield、spare consumption distribution 和测试成本。
+
+---
+
+## 9. SRAM、HBM 与 3D DRAM 的真实交换
+
+| 属性 | SRAM Accelerator | HBM4 系统 | Raptor 3D DRAM |
+|---|---:|---:|---:|
+| 报道示例容量 | 约 2–4 GB | 约 192 GB | 32 GB |
+| 峰值带宽 | 约 300 TB/s | 约 18–20 TB/s | 约 100 TB/s |
+| 接口能效 | 约 0.1 pJ/bit | 约 2.4–2.5 pJ/bit | 0.3–0.37 pJ/bit |
+| 容量密度 | 最低 | 最高 | 报道称约为 HBM4 的一半 |
+| 主要约束 | 面积、漏电、成本 | PHY、beachfront、功耗 | 热、良率、容量、系统拼接 |
+
+“SRAM-class bandwidth”可以成立，因为 100 TB/s 已进入数百 TB/s 的数量级；“SRAM-class latency”则没有证据。
+
+Raptor 仍保留 DRAM 的基本行为：
+
+- activate/precharge；
+- row-buffer hit/miss；
+- bank conflict；
+- refresh；
+- retention；
+- ECC decode；
+- aggregation latency。
+
+准确表述应是：
+
+> **Raptor 接近 SRAM 的 aggregate bandwidth 与接口能效，但保留 DRAM 的访问时序、刷新和可靠性约束。**
+
+---
+
+## 10. 为什么它适合 LLM Decode
+
+### 10.1 Decode 首先是权重整读问题
+
+在低 batch decode 中，每生成一个 token，通常需要读取一次活跃权重。理论 aggregate throughput 上限为：
+
+$$
+TPS_{aggregate}
+\le
+\frac{B_{effective}}
+{W_{active/token}}
+$$
+
+取有效带宽 85 TB/s：
+
+| 每 token 活跃权重 | 带宽上限 |
+|---:|---:|
+| 10 GB | 8,500 tok/s |
+| 20 GB | 4,250 tok/s |
+| 40 GB | 2,125 tok/s |
+| 80 GB | 1,062 tok/s |
+| 160 GB | 531 tok/s |
+
+这解释了 Raptor 对 MoE decode 的吸引力。一个模型可以拥有数万亿总参数，但每个 token 只激活少量 experts。若活跃权重约 80 GB，85 TB/s 恰好对应约 1,000 tok/s 的带宽上限。
+
+### 10.2 Dense 模型不会得到同样结果
+
+3T 参数以 INT4 存储，完整权重约为：
+
+$$
+3\times10^{12}
+\times0.5\ \mathrm{B}
+=1.5\ \mathrm{TB}
+$$
+
+若每个 token 都读取全部权重：
+
+$$
+TPS_{dense,upper}
+\approx
+\frac{85\ \mathrm{TB/s}}
+{1.5\ \mathrm{TB}}
+=56.7\ \mathrm{tok/s}
+$$
+
+所以“3T-class、1,000 TPS”几乎必然依赖稀疏激活、多单元并行或特殊 TPS 口径。
+
+### 10.3 它改变了 Batch 的经济性
+
+GPU decode 常通过 batch 让多个 token 分摊同一次权重读取：
+
+```text
+权重读取昂贵
+-> 必须提高 batch
+-> 提高 aggregate throughput
+-> 单用户等待 batch 发车
+```
+
+Raptor 提高带宽/容量比后，单 token 独自支付权重读取的成本显著下降：
+
+```text
+权重读取便宜
+-> 小 batch 也可接受
+-> 降低排队与发车间隔
+-> 改善单用户 TPOT
+```
+
+这可能比峰值 aggregate TPS 更重要。推理产品真正稀缺的不是“机房总 token”，而是在成本约束下可交付的低延迟 token。
+
+---
+
+## 11. 3T 模型与 1M Context 性能审计
+
+报道中的演示图声称，Raptor 在 1M context 下可为 3T-class model 提供约 1,000 TPS/user，并给出 GLM 5.2 最高约 3,153 TPS/user、Kimi K3 最高约 988 TPS/user 的图示。
+
+这组数字缺少以下配置：
+
+- 模型总参数与 active parameters；
+- 权重精度与 KV 精度；
+- Raptor 单元数量；
+- pipeline、tensor、expert parallel 布局；
+- attention 类型；
+- speculative decoding 的 draft/acceptance 配置；
+- TPS 是单流、aggregate 还是 accepted token rate；
+- TTFT、TPOT 与并发用户数。
+
+### 11.1 1M Context 的 KV 约束
+
+对标准 attention，单 token 的历史 KV 读取量可写为：
+
+$$
+B_{KV/token}
+=
+2LSH_{KV}db
+$$
+
+其中：
+
+- $L$：层数；
+- $S$：上下文长度；
+- $H_{KV}$：KV head 数；
+- $d$：head dimension；
+- $b$：每元素字节数。
+
+当 $S=10^6$ 时，即使使用 GQA，KV 读取也可能压过权重读取。要达到约 1,000 TPS/user，通常还需要至少一种机制：
+
+- MLA 或其他 KV compression；
+- 极少 KV heads；
+- sliding-window/local attention；
+- recurrent/linear attention；
+- KV shard 上的近存 attention；
+- speculative decoding；
+- 多卡并行扫描 KV。
+
+因此端到端 token latency 必须写成：
+
+$$
+T_{token}
+=
+T_{weight}
++T_{KV}
++T_{compute}
++T_{fabric}
++T_{sync}
+$$
+
+Raptor 直接优化的是 $T_{weight}$，也可能通过近存计算优化部分 $T_{KV}$，但文章没有提供足够数据证明整个公式都按同样比例下降。
+
+---
+
+## 12. 从单器件扩展到系统后，瓶颈移到哪里
+
+单个 32 GB Raptor 大致只能容纳：
+
+| 权重格式 | 可容纳参数量 |
+|---|---:|
+| FP16/BF16 | 约 16B |
+| INT8/FP8 | 约 32B |
+| INT4 | 约 64B |
+
+3T INT4 权重需要的最少单元数约为：
+
+$$
+N_{Raptor}
+\ge
+\frac{1.5\ \mathrm{TB}}
+{32\ \mathrm{GB}}
+\approx47
+$$
+
+这还没有加入 KV Cache、冗余、embedding、runtime workspace 和容量碎片。
+
+当系统扩展到几十个 Raptor 单元后，瓶颈从本地 DRAM 转向：
+
+1. **Activation fabric**：每层或每个 expert 的输入输出如何传输；
+2. **Expert routing**：热门 expert 是否压垮局部单元；
+3. **Pipeline latency**：几十个 stage 的固定 hop latency 是否累积；
+4. **Reduction**：tensor parallel 或 attention shard 如何归约；
+5. **Capacity placement**：权重和 KV 如何避免频繁迁移；
+6. **Failure recovery**：任一 3D stack 故障时如何恢复模型状态。
+
+因此，系统性能不是简单相加：
+
+$$
+B_{system}
+\neq
+N\times100\ \mathrm{TB/s}
+$$
+
+更准确的上限是：
+
+$$
+Throughput
+\le
+\min(
+T_{local-memory}^{-1},
+T_{compute}^{-1},
+T_{fabric}^{-1},
+T_{sync}^{-1}
+)
+$$
+
+本地 100 TB/s 会把瓶颈推向 fabric 和调度，而不是让系统从此没有瓶颈。
+
+---
+
+## 13. 与计算型 KV 状态平面的结合
+
+Raptor 可以成为两类状态平面的物理候选。
+
+### 13.1 3D DRAM 权重平面
+
+MoE expert 权重常驻本地 DRAM，由本地 tensor engine 完成 FFN：
+
+```text
+token activation
+    -> scale-up fabric
+    -> Raptor local expert
+    -> local weight stream + tensor compute
+    -> output activation
+```
+
+外部 fabric 只搬 activation，不搬 expert weights。若每个 token 的 activation 为 $O(D)$，而 expert weight 为 $O(D^2)$，数据流收益非常明显。
+
+### 13.2 计算型 KV 状态平面
+
+如果 tensor engine 支持 attention primitive，也可以让历史 KV 常驻 DRAM，在本地执行：
+
+$$
+QK^T
+\rightarrow
+\operatorname{softmax}
+\rightarrow
+PV
+$$
+
+外部只传输当前 token 的 $Q/K_{new}/V_{new}$ 和 context vector。这样可以把历史 KV 的跨设备流量从：
+
+$$
+O(SD_{KV})
+$$
+
+降低为：
+
+$$
+O(D)
+$$
+
+但文章尚未证明 Raptor 已经具备完整 KV state plane 所需的：
+
+- online softmax；
+- 跨 shard 的 $(m,l,o)$ 精确归约；
+- page allocator；
+- prefix sharing；
+- session-layer affinity；
+- KV migration；
+- attention p99 latency 控制。
+
+它给出了很有吸引力的物理底座，但系统软件和分布式协议仍然需要单独设计。
+
+---
+
+## 14. 还需要哪些验证数据
+
+### 14.1 器件级
+
+- 顺序、随机、stride、hotspot 下的 sustained bandwidth；
+- read、write、read-modify-write 的独立能效；
+- 0.37 pJ/bit 是否包含 DRAM array、ECC 和 local delivery；
+- 25°C、85°C、105°C 下的 refresh、带宽与错误率；
+- bank conflict 和 96 B/128 B 聚合效率；
+- ECC correction latency 与不可纠正错误率。
+
+### 14.2 封装级
+
+- 36 µm face-to-face bonding yield；
+- logic die、DRAM die 与完整 stack 面积；
+- 300 W I/O 加 tensor compute 后的总功耗；
+- cold plate 到 logic/DRAM 的热阻；
+- power delivery droop 与 simultaneous switching noise；
+- spare bank remap 后的 timing skew。
+
+### 14.3 系统级
+
+- 1、8、64 个单元的 scaling efficiency；
+- 单用户 TPOT、aggregate TPS 和并发度三者的完整曲线；
+- MoE expert load imbalance 与动态路由；
+- 1M context 下的实际 KV bytes/token；
+- 相同模型、精度、batch、SLO 下与 HBM4 的端到端比较；
+- 性能、功耗、成本和良率的统一 TCO 模型。
+
+最终需要观察的不是单点峰值，而是条件分布：
+
+$$
+P(
+T_{token}>x
+\mid
+N,
+batch,
+context,
+routing,
+temperature,
+failure
+)
+$$
+
+只有当卡数、上下文、负载和温度上升时，token latency 仍然保持可预测，100 TB/s 才真正转化成 serving value。
+
+---
+
+## 配图建议
+
+> **图 1：HBM 横向 PHY 与 Raptor 垂直 I/O 对比**  
+> 左侧画 HBM stack、PHY、interposer、GPU NoC；右侧画 logic-on-DRAM 和 bank-to-engine 局部路径。强调被删除的是 package-scale PHY 与全局搬运，不是所有 I/O 电路。
+
+> **图 2：100 TB/s 的能耗算术**  
+> 使用三根柱：0.37 pJ/bit 对应 296 W；2.4 pJ/bit 对应 1.92 kW；5 pJ/bit 对应 4 kW。明确标注三者的系统边界不同。
+
+> **图 3：840 Banks 到 256 Tensor Engines 的粒度重组**  
+> 展示 3 bank × 32 B = 96 B，以及 4 × 96 B = 3 × 128 B 的聚合过程。
+
+> **图 4：Logic-on-top 热路径**  
+> 展示 cold plate、N4 logic、face-to-face interconnect、custom DRAM 和 package，并标注 105°C、4 ms refresh。
+
+> **图 5：从 32 GB 单元扩展到 3T MoE 系统**  
+> 展示权重分片、activation fabric、KV plane 和 pipeline stage，突出瓶颈从本地内存转移到跨单元通信。
+
+---
+
+## 结语
+
+Raptor 揭示了 AI 推理芯片的一条重要分叉：未来的竞争不只是“谁能封装更多 HBM”，而是谁能重新定义计算看到数据的物理距离。
+
+HBM 的优势是容量、生态与通用性。它的代价是 PHY、beachfront 和从 memory controller 到 tensor engine 的多级搬运。Raptor 用 3D 集成把这条路径压缩为垂直连接，再用 bank 与 tensor engine 的共同设计，把 DRAM 内部并行度直接暴露给计算。这就是 100 TB/s 和 0.37 pJ/bit 背后的真实机制。
+
+但器件带宽不是系统吞吐。32 GB 容量意味着大型模型必须跨几十个单元部署；100 TB/s 本地带宽会把瓶颈推向 activation fabric、KV 扫描、expert imbalance、pipeline latency 和故障恢复。文章目前最有说服力的是器件方向与 I/O 能耗算术，最缺的是端到端边界一致的第三方测量。
+
+实践上的判断标准很简单：不要只问它有多少 TB/s，要问这些带宽在什么访问模式、什么温度、什么模型布局和什么并发下能够持续；不要只问 pJ/bit，要问这个数字从 DRAM cell 算到哪里；不要只看 1,000 TPS，要同时看 active parameters、KV bytes/token、卡数与 TPOT。
+
+**100 TB/s 解决的是本地数据供给。真正决定 Raptor 能否改变推理系统的，是它能否让计算长期留在数据所在的位置。**
