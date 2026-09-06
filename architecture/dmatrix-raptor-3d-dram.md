@@ -16,7 +16,11 @@ content_type: analysis
 
 # 100 TB/s 不是更快的 DRAM：d-Matrix Raptor 如何删除 HBM 的片外内存边界[Y26W36][解析]
 
-***先给答案——Raptor 的价值不在于把 DRAM cell 做得更快，而在于把计算逻辑放到 DRAM 上方，缩短 memory-to-compute 路径。它可能让低 batch 的 MoE decode 更容易获得高吞吐，但 100 TB/s 仍只是局部器件带宽，不能直接等同于模型级 token/s。本文要回答三个问题：这组数字是否自洽，哪些 workload 真能受益，以及系统扩展后瓶颈会迁移到哪里。***
+***先给结论：Raptor 的关键变化不是把 DRAM cell 做得更快，而是把计算逻辑和 DRAM 垂直堆叠，让数据在更靠近计算的位置被消费。它试图删除 HBM 中较长的 memory-to-compute 数据路径，用更多、更短的垂直连接换取局部高带宽和较低的接口能耗。***
+
+***但“100 TB/s”首先是器件级峰值，不是模型级性能。它只有在权重布局、bank 并行、调度和计算单元都能持续匹配时，才会转化成有效带宽；当系统扩展到多个单元后，瓶颈还会转移到 activation fabric、KV 访问、排队、同步和故障恢复。***
+
+***因此，本文不把厂商规格直接当成产品结论，而是沿着“物理结构 → 数字口径 → workload → 多单元系统”逐层检查：哪些数字能够自洽，低 batch 的 MoE decode 为什么可能受益，以及 3T 模型、1M context 和 1,000 TPS/user 这组宣传数字还缺少哪些前提。最终判断是：Raptor 可能打开一个新的 bandwidth-capacity 工作点，但公开资料尚不足以证明它已经闭合了从器件带宽到端到端 serving 性能的链路。***
 
 ## 原始材料
 
