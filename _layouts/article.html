@@ -10,7 +10,8 @@ layout: default
       {% if page.updated %} · 更新于 {{ page.updated | date: "%Y-%m-%d" }}{% endif %}
     </p>
   </header>
-  {{ content }}
+  {% capture asset_root %}src="{{ site.baseurl }}/assets/{% endcapture %}
+  {{ content | replace: 'src="/assets/', asset_root }}
   <footer class="article-footer">
     <p>本文以 GitHub Markdown 为唯一源稿。勘误与更新以仓库版本为准。</p>
     {% if page.wechat_url %}<p><a href="{{ page.wechat_url }}">微信公众号版本</a></p>{% endif %}
