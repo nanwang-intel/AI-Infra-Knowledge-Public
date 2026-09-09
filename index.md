@@ -17,3 +17,7 @@ Publicly approved AI infrastructure architecture analysis.
 
 审计 Mooncake TENT 的 TPU/PJRT staging、Host DRAM 中转路径、实机缺陷与 TPU-Sync 关系，区分已合入能力和生产可用边界。
 
+### [从一个 Token 出发：硬件架构师如何读懂 TPU 推理优化](architecture/tpu-inference-hardware-software-codesign/)
+
+先补齐 Attention、KV Cache、MoE 和 GDN 的最少模型知识，再把 TPU 推理优化还原为计算、内存、互连和状态管理问题。
+
